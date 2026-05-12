@@ -7,9 +7,13 @@ on:
 
 jobs:
   process:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     permissions:
       contents: write           # needed to move ZIP to processed/ in repo
+    concurrency:
+      group: sks-submission-processor
+      cancel-in-progress: false
 
     steps:
       - name: Checkout repo

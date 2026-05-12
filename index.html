@@ -1797,10 +1797,9 @@ function publishPDF() {
     }
   }
 
-  /* ── SKS: Config (set these before deploying) ── */
-  const SKS_GITHUB_OWNER = 'SID-cmd-sk';   
-  const SKS_GITHUB_REPO  = 'POST';         
-  const SKS_GITHUB_TOKEN = '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'; 
+  const SKS_SUBMISSION_GATEWAY_BASE = '';
+  const SKS_STATUS_POLL_MS = 3000;
+  const SKS_STATUS_TIMEOUT_MS = 12 * 60 * 1000;
 
   /* ── Notification helpers ── */
   function sksShowNotify(type, msg, showClear) {
@@ -1831,45 +1830,129 @@ function publishPDF() {
     setTimeout(sksHideNotify, 3000);
   }
 
-  /* ── GitHub upload: push ZIP into submissions/ folder ── */
-  async function sksUploadToGitHub(zipBlob, zipName, jsonData) {
-    sksShowNotify('uploading', 'Sending your submission to SKS Scantech…', false);
+  async function sksSha256Hex(arrayBuf) {
+    const digest = await crypto.subtle.digest('SHA-256', arrayBuf);
+    const bytes = new Uint8Array(digest);
+    let hex = '';
+    for (const b of bytes) hex += b.toString(16).padStart(2, '0');
+    return hex;
+  }
+
+  function sksGatewayUrl(path) {
+    const base = (SKS_SUBMISSION_GATEWAY_BASE || '').replace(/\/+$/, '');
+    return base ? (base + path) : '';
+  }
+
+  function sksFormatPct(n) {
+    if (!isFinite(n) || n < 0) return '0%';
+    if (n > 100) return '100%';
+    return Math.round(n) + '%';
+  }
+
+  async function sksPollStatus(submissionId, startMsg) {
+    const statusUrl = sksGatewayUrl('/status') + '?submission_id=' + encodeURIComponent(submissionId);
+    if (!SKS_SUBMISSION_GATEWAY_BASE) return;
+    const started = Date.now();
+
+    async function tick() {
+      if (Date.now() - started > SKS_STATUS_TIMEOUT_MS) {
+        sksShowNotify('success', startMsg + '  —  Status: taking longer than expected. SKS will still process it.', true);
+        return;
+      }
+
+      try {
+        const res = await fetch(statusUrl, { method: 'GET' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data || !data.ok || !data.workflow) {
+          setTimeout(tick, SKS_STATUS_POLL_MS);
+          return;
+        }
+
+        const st = data.workflow.status;
+        const conc = data.workflow.conclusion;
+
+        if (st === 'completed') {
+          if (conc === 'success') {
+            sksShowNotify('success', startMsg + '  —  Status: processed successfully.', true);
+          } else {
+            sksShowNotify('success', startMsg + '  —  Status: processing finished with warnings. SKS will review.', true);
+          }
+          return;
+        }
+
+        sksShowNotify('uploading', startMsg + '  —  Status: ' + (st || 'queued') + '…', true);
+        setTimeout(tick, SKS_STATUS_POLL_MS);
+      } catch {
+        setTimeout(tick, SKS_STATUS_POLL_MS);
+      }
+    }
+
+    setTimeout(tick, SKS_STATUS_POLL_MS);
+  }
+
+  async function sksUploadToGateway(zipBlob, zipName, jsonData) {
+    if (!SKS_SUBMISSION_GATEWAY_BASE) {
+      sksShowNotify('error',
+        '✗ Upload failed: submission gateway is not configured. ' +
+        'Your PDF was still downloaded. Please email it to SKS Scantech manually.',
+        false);
+      return;
+    }
+
+    sksShowNotify('uploading', 'Sending your submission to SKS Scantech… 0%', false);
+
     try {
       const arrayBuf = await zipBlob.arrayBuffer();
-      const bytes    = new Uint8Array(arrayBuf);
-      let binary = '';
-      bytes.forEach(b => binary += String.fromCharCode(b));
-      const b64 = btoa(binary);
+      const sha = await sksSha256Hex(arrayBuf);
 
-      const path = 'submissions/' + zipName;
-      const apiUrl = `https://api.github.com/repos/${SKS_GITHUB_OWNER}/${SKS_GITHUB_REPO}/contents/${path}`;
+      const form = new FormData();
+      form.append('zip', new Blob([arrayBuf], { type: 'application/zip' }), zipName);
+      form.append('zip_name', zipName);
 
-      const res = await fetch(apiUrl, {
-        method : 'PUT',
-        headers: {
-          'Authorization': `Bearer ${SKS_GITHUB_TOKEN}`,
-          'Content-Type' : 'application/json',
-          'Accept'       : 'application/vnd.github+json'
-        },
-        body: JSON.stringify({
-          message: `New submission: ${zipName}`,
-          content: b64
-        })
+      const submitUrl = sksGatewayUrl('/submit');
+
+      const res = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', submitUrl, true);
+        xhr.responseType = 'json';
+        xhr.setRequestHeader('X-Idempotency-Key', sha);
+
+        xhr.upload.onprogress = ev => {
+          if (!ev.lengthComputable) return;
+          const pct = sksFormatPct((ev.loaded / ev.total) * 100);
+          sksShowNotify('uploading', 'Sending your submission to SKS Scantech… ' + pct, false);
+        };
+
+        xhr.onerror = () => reject(new Error('Network error'));
+        xhr.onload = () => resolve({ status: xhr.status, data: xhr.response });
+        xhr.send(form);
       });
 
-      if (res.ok) {
-        sksSaveCache(jsonData, zipName);
-        sksShowNotify('success',
+      if (res.status === 409 && res.data && res.data.submission_id) {
+        const msg =
           '✓ Submitted successfully! SKS Scantech will process your request shortly. ' +
-          'Your form data is saved temporarily in this browser.',
-          true);
-      } else {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.message || `HTTP ${res.status}`);
+          'Your form data is saved temporarily in this browser.';
+        sksSaveCache(jsonData, zipName);
+        sksShowNotify('success', msg, true);
+        sksPollStatus(res.data.submission_id, msg);
+        return;
       }
+
+      if (res.status >= 200 && res.status < 300 && res.data && res.data.ok && res.data.submission_id) {
+        const msg =
+          '✓ Submitted successfully! SKS Scantech will process your request shortly. ' +
+          'Your form data is saved temporarily in this browser.';
+        sksSaveCache(jsonData, zipName);
+        sksShowNotify('success', msg, true);
+        sksPollStatus(res.data.submission_id, msg);
+        return;
+      }
+
+      const msg = (res.data && res.data.error) ? res.data.error : ('HTTP ' + res.status);
+      throw new Error(msg);
     } catch(e) {
       sksShowNotify('error',
-        '✗ Upload failed: ' + e.message +
+        '✗ Upload failed: ' + (e && e.message ? e.message : 'Unknown error') +
         '  —  Your PDF was still downloaded. Please email it to SKS Scantech manually.',
         false);
     }
@@ -1890,7 +1973,7 @@ function publishPDF() {
       btn.disabled = false;
       btn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 18 15 15"/></svg> Publish PDF';
     }
-    sksUploadToGitHub(zipBlob, zipName, jsonData);
+    sksUploadToGateway(zipBlob, zipName, jsonData);
   }
 
   function buildFormJSON() {
