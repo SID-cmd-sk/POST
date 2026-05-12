@@ -1,0 +1,8 @@
+[vars]
+GITHUB_BRANCH = "main"
+MAX_ZIP_BYTES = "15728640"
+RATE_LIMIT_PER_MINUTE = "8"
+
+main = "src/worker.mjs"
+compatibility_date = "2026-05-12"
+
