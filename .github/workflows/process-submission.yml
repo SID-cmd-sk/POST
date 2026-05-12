@@ -1,0 +1,46 @@
+name: Process Submission
+
+on:
+  workflow_dispatch:
+    inputs:
+      submission_id:
+        required: true
+      submitter_name:
+        required: true
+      submitter_email:
+        required: true
+      file_count:
+        required: true
+      timestamp:
+        required: true
+      hmac_signature:
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: |
+          pip install reportlab openpyxl google-api-python-client google-auth
+
+      - name: Generate PDF
+        run: |
+          python scripts/generate_pdf.py
+
+      - name: Update database
+        run: |
+          python scripts/update_database.py
+
+      - name: Upload Drive
+        run: |
+          python scripts/upload_drive.py
